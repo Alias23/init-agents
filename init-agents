@@ -1,0 +1,1781 @@
+#!/usr/bin/env bash
+# init-agents — Genera la estructura Spec-Driven Development (SDD) en el proyecto actual.
+# Requiere Bash 4+.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Estado y valores por defecto
+# ---------------------------------------------------------------------------
+PROJECT_NAME=""
+PROJECT_DESCRIPTION=""
+STACK=""
+TEST_COMMAND=""
+TEST_COMMAND_YAML=""
+DATA_STORE=""
+UI_CHECK=""
+CODE_LANGUAGE=""
+DOC_LANGUAGE=""
+TODAY="$(date +%F)"
+
+PROJECT_NAME_ESC=""
+PROJECT_DESCRIPTION_ESC=""
+STACK_ESC=""
+TEST_COMMAND_ESC=""
+TEST_COMMAND_YAML_ESC=""
+DATA_STORE_ESC=""
+UI_CHECK_ESC=""
+CODE_LANGUAGE_ESC=""
+DOC_LANGUAGE_ESC=""
+GUIDE_LINK=""
+GUIDE_LINK_ESC=""
+GUIDE_REFERENCE=""
+GUIDE_REFERENCE_ESC=""
+
+FORCE=false
+APPEND_AGENTS=false
+DRY_RUN=false
+ASSUME_YES=false
+LIST_ONLY=false
+NO_GUIDE=false
+
+CREATED=0
+SKIPPED=0
+OVERWRITTEN=0
+APPENDED=0
+TOTAL_FILES=0
+
+MARKER_START="<!-- init-agents:sdd:start -->"
+
+# ---------------------------------------------------------------------------
+# Salida
+# ---------------------------------------------------------------------------
+info() { printf '%s\n' "$*"; }
+ok() { printf '  [ok] %s\n' "$*"; }
+skipped() { printf '  [skip] %s\n' "$*"; }
+warn() { printf '  [warn] %s\n' "$*" >&2; }
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+init-agents $VERSION — Genera la estructura Spec-Driven Development en el proyecto actual.
+
+USO:
+  init-agents [opciones]
+
+El script se ejecuta en el directorio actual. No lo ejecutes en / ni en \$HOME.
+
+OPCIONES:
+  --name TEXTO             Nombre del proyecto.
+  --description TEXTO      Descripción breve del proyecto.
+  --stack TEXTO            Stack principal.
+  --test-command COMANDO   Comando de tests.
+  --data-store TEXTO       Persistencia de datos.
+  --ui-check TEXTO         Cómo verificar la interfaz.
+  --code-language IDIOMA   Idioma del código.
+  --doc-language IDIOMA    Idioma de documentación e interfaz.
+  -y, --yes                Usa los valores detectados sin preguntar.
+  -f, --force              Sobrescribe archivos existentes con backup.
+  --append-agents          Añade el bloque SDD a un AGENTS.md existente.
+  --no-guide               No genera docs/sdd.md (la guía del flujo).
+  -n, --dry-run            Muestra lo que haría sin escribir.
+  --list                   Lista los archivos que generaría.
+  -h, --help               Muestra esta ayuda.
+  -v, --version            Muestra la versión.
+
+EJEMPLOS:
+  cd mi-proyecto && init-agents
+  init-agents --yes
+  init-agents --append-agents
+  init-agents --force --test-command "npm test"
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+backup_file() {
+  local path="$1"
+  local ts backup n=1
+  ts="$(date +%Y%m%d%H%M%S)"
+  backup="${path}.bak.${ts}"
+  while [[ -e "$backup" ]]; do
+    backup="${path}.bak.${ts}.${n}"
+    n=$((n + 1))
+  done
+  cp -p "$path" "$backup" || die "No se pudo crear el backup de $path"
+  warn "backup: $backup"
+}
+
+render_content() {
+  local content="$1"
+  content="${content//'{{PROJECT_NAME}}'/$PROJECT_NAME_ESC}"
+  content="${content//'{{PROJECT_DESCRIPTION}}'/$PROJECT_DESCRIPTION_ESC}"
+  content="${content//'{{STACK}}'/$STACK_ESC}"
+  content="${content//'{{TEST_COMMAND_YAML}}'/$TEST_COMMAND_YAML_ESC}"
+  content="${content//'{{TEST_COMMAND}}'/$TEST_COMMAND_ESC}"
+  content="${content//'{{DATA_STORE}}'/$DATA_STORE_ESC}"
+  content="${content//'{{UI_CHECK}}'/$UI_CHECK_ESC}"
+  content="${content//'{{CODE_LANGUAGE}}'/$CODE_LANGUAGE_ESC}"
+  content="${content//'{{DOC_LANGUAGE}}'/$DOC_LANGUAGE_ESC}"
+  content="${content//'{{GUIDE_LINK}}'/$GUIDE_LINK_ESC}"
+  content="${content//'{{GUIDE_REFERENCE}}'/$GUIDE_REFERENCE_ESC}"
+  content="${content//'{{DATE}}'/$TODAY}"
+  printf '%s' "$content"
+}
+
+write_file() {
+  local path="$1"
+  local content="$2"
+
+  if $DRY_RUN; then
+    if [[ -e "$path" ]]; then
+      if $FORCE; then
+        info "  [dry-run] sobrescribiría $path"
+      else
+        info "  [dry-run] omitiría $path (ya existe)"
+      fi
+    else
+      info "  [dry-run] crearía $path"
+    fi
+    return 0
+  fi
+
+  if [[ -e "$path" ]]; then
+    if $FORCE; then
+      backup_file "$path"
+      mkdir -p "$(dirname "$path")"
+      printf '%s\n' "$content" >"$path"
+      ok "sobrescrito $path"
+      OVERWRITTEN=$((OVERWRITTEN + 1))
+    else
+      skipped "$path (ya existe)"
+      SKIPPED=$((SKIPPED + 1))
+    fi
+  else
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' "$content" >"$path"
+    ok "creado $path"
+    CREATED=$((CREATED + 1))
+  fi
+}
+
+render_file() {
+  local path="$1"
+  local content
+  content="$(cat)"
+  content="$(render_content "$content")"
+  write_file "$path" "$content"
+}
+
+# ---------------------------------------------------------------------------
+# Detección de valores
+# ---------------------------------------------------------------------------
+detect_project_name() {
+  basename "$PWD"
+}
+
+detect_description() {
+  printf '%s\n' "Proyecto gestionado con Spec-Driven Development (SDD)."
+}
+
+detect_stack() {
+  if [[ -f package.json ]]; then
+    if grep -q '"next"' package.json 2>/dev/null; then
+      printf '%s\n' "Next.js"
+    elif grep -q '"react"' package.json 2>/dev/null; then
+      printf '%s\n' "React"
+    elif grep -q '"vue"' package.json 2>/dev/null; then
+      printf '%s\n' "Vue"
+    elif grep -q '"svelte"' package.json 2>/dev/null; then
+      printf '%s\n' "Svelte"
+    else
+      printf '%s\n' "Node.js/JavaScript"
+    fi
+  elif [[ -f pyproject.toml || -f requirements.txt || -f setup.py ]]; then
+    printf '%s\n' "Python"
+  elif [[ -f go.mod ]]; then
+    printf '%s\n' "Go"
+  elif [[ -f Cargo.toml ]]; then
+    printf '%s\n' "Rust"
+  elif [[ -f index.html ]]; then
+    printf '%s\n' "HTML/CSS/JS"
+  else
+    printf '%s\n' "el stack del proyecto"
+  fi
+}
+
+detect_test_command() {
+  if [[ -f package.json ]]; then
+    if grep -q '"test"[[:space:]]*:' package.json 2>/dev/null; then
+      if [[ -f pnpm-lock.yaml ]]; then
+        printf '%s\n' "pnpm test"
+      elif [[ -f yarn.lock ]]; then
+        printf '%s\n' "yarn test"
+      elif [[ -f bun.lockb || -f bun.lock ]]; then
+        printf '%s\n' "bun test"
+      else
+        printf '%s\n' "npm test"
+      fi
+    else
+      printf '%s\n' "no definido"
+    fi
+  elif [[ -f pyproject.toml || -f pytest.ini || -f tox.ini ]]; then
+    printf '%s\n' "pytest"
+  elif [[ -f go.mod ]]; then
+    printf '%s\n' "go test ./..."
+  elif [[ -f Cargo.toml ]]; then
+    printf '%s\n' "cargo test"
+  else
+    printf '%s\n' "no definido"
+  fi
+}
+
+grep_code() {
+  local pattern="$1"
+  grep -Rqs \
+    --exclude-dir=.git \
+    --exclude-dir=node_modules \
+    --exclude-dir=.opencode \
+    --exclude-dir=.agents \
+    --include='*.js' \
+    --include='*.ts' \
+    --include='*.jsx' \
+    --include='*.tsx' \
+    --include='*.html' \
+    --include='*.py' \
+    --include='*.go' \
+    --include='*.rs' \
+    -- "$pattern" . 2>/dev/null
+}
+
+detect_data_store() {
+  if grep_code 'localStorage'; then
+    printf '%s\n' "localStorage"
+  elif grep_code 'sqlite'; then
+    printf '%s\n' "SQLite"
+  elif grep_code 'postgres'; then
+    printf '%s\n' "PostgreSQL"
+  else
+    printf '%s\n' "la persistencia del proyecto"
+  fi
+}
+
+detect_ui_check() {
+  if [[ -f index.html ]]; then
+    printf '%s\n' "manual en el navegador"
+  else
+    printf '%s\n' "no aplica"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Preguntas interactivas
+# ---------------------------------------------------------------------------
+ask_var() {
+  local __var="$1"
+  local label="$2"
+  local default="$3"
+  local value=""
+
+  if $ASSUME_YES || [[ ! -t 0 ]]; then
+    printf -v "$__var" '%s' "$default"
+    return 0
+  fi
+
+  IFS= read -r -p "$label [$default]: " value || true
+  printf -v "$__var" '%s' "${value:-$default}"
+}
+
+validate_value() {
+  local name="$1"
+  local value="$2"
+  if [[ "$value" == *"{{"* || "$value" == *"}}"* ]]; then
+    die "$name no puede contener '{{' o '}}'."
+  fi
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    die "$name no puede contener saltos de línea."
+  fi
+}
+
+escape_replacement() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  printf '%s' "$value"
+}
+
+# ---------------------------------------------------------------------------
+# Lista de archivos
+# ---------------------------------------------------------------------------
+list_files() {
+  cat <<'FILES_EOF'
+AGENTS.md
+MEMORY.md
+docs/README.md
+docs/constitution.md
+FILES_EOF
+  if ! $NO_GUIDE; then
+    printf '%s\n' "docs/sdd.md"
+  fi
+  cat <<'FILES_EOF'
+specs/README.md
+specs/_template/spec.md
+specs/_template/plan.md
+specs/_template/tasks.md
+tests/README.md
+.agents/skills/sdd/SKILL.md
+.opencode/agents/coordinator.md
+.opencode/agents/planner.md
+.opencode/agents/implementer.md
+.opencode/agents/reviewer.md
+.opencode/commands/sdd-constitution.md
+.opencode/commands/sdd-spec.md
+.opencode/commands/sdd-clarify.md
+.opencode/commands/sdd-plan.md
+.opencode/commands/sdd-tasks.md
+.opencode/commands/sdd-implement.md
+.opencode/commands/sdd-validate.md
+.opencode/commands/sdd-change.md
+.opencode/commands/sdd-status.md
+FILES_EOF
+}
+
+# ---------------------------------------------------------------------------
+# Contenido: AGENTS.md
+# ---------------------------------------------------------------------------
+render_agents_full() {
+  render_content "$(cat <<'AGENTS_FULL_EOF'
+# AGENTS.md — {{PROJECT_NAME}}
+
+{{PROJECT_DESCRIPTION}}
+
+## Stack y estructura
+
+- **Stack:** {{STACK}}
+- **Tests:** `{{TEST_COMMAND}}`
+- **Persistencia:** {{DATA_STORE}}
+- **Verificación visual:** {{UI_CHECK}}
+
+<!-- TODO: describe qué hay en cada carpeta o archivo importante (solo lo que no es obvio). -->
+
+## Comandos
+
+- Ejecutar: <!-- TODO: comando exacto -->
+- Tests: `{{TEST_COMMAND}}`
+- Lint: <!-- TODO: comando exacto -->
+- Compilar: <!-- TODO: comando exacto, si aplica -->
+
+## Reglas
+
+- Lee `docs/constitution.md` y la spec activa (`specs/NNN-*/`) antes de tocar código.
+- No implementes nada que no esté en la spec activa.
+- No avances de fase sin aprobación explícita del usuario.
+- Actualiza `MEMORY.md` al terminar cada tarea.
+
+## Convenciones
+
+- Código en {{CODE_LANGUAGE}}; interfaz y documentación en {{DOC_LANGUAGE}}.
+- <!-- TODO: estilo, nombres, patrones y archivo de referencia. -->
+
+## Reglas de dominio / trampas conocidas
+
+- <!-- TODO: lo que es fácil hacer mal y el agente no puede deducir leyendo el código. -->
+
+## Forma de trabajar
+
+- Planifica antes de tocar código cuando el cambio afecte a más de un archivo o a un requisito.
+- Haz cambios pequeños y enfocados; no reescribas lo que ya funciona.
+- Al terminar, resume qué has cambiado, qué has verificado y cualquier decisión que deba revisar el usuario.
+- Sigue el flujo SDD de {{GUIDE_REFERENCE}}.
+
+## Memoria
+
+- Al empezar, lee `MEMORY.md` para conocer el estado del proyecto y las decisiones tomadas.
+- Al terminar una tarea, actualízalo: estado actual, decisiones importantes (con su porqué) y errores a evitar.
+- Mantenlo breve (máximo ~50 líneas): resume o elimina lo que ya no aporte.
+- Si algo se convierte en una regla permanente, propón moverlo a `AGENTS.md` en lugar de dejarlo en la memoria.
+- No guardes nunca datos sensibles (claves, tokens, datos personales).
+
+## Límites
+
+- ✅ Siempre: seguir `docs/constitution.md`, actualizar `MEMORY.md` al terminar cada tarea y mantener los tests en verde.
+- ⚠ Pregunta antes: añadir dependencias nuevas, crear archivos nuevos fuera de la estructura prevista o cambiar el formato de los datos.
+- 🚫 Nunca: modificar `docs/constitution.md` sin pasar por `/sdd-constitution`, tocar secretos o hacer cambios destructivos.
+
+## Verificación
+
+- Ejecuta `{{TEST_COMMAND}}` antes de dar un cambio por terminado.
+- Si hay interfaz, verifica con {{UI_CHECK}}.
+- <!-- TODO: añade cualquier comprobación específica del proyecto. -->
+AGENTS_FULL_EOF
+)"
+}
+
+render_agents_block() {
+  render_content "$(cat <<'AGENTS_BLOCK_EOF'
+<!-- init-agents:sdd:start -->
+## Spec-Driven Development (SDD)
+
+Este proyecto usa SDD. Lee `docs/constitution.md` y la spec activa (`specs/NNN-*/`) antes de tocar código. Sigue {{GUIDE_REFERENCE}}.
+
+### Comandos
+
+- Tests: `{{TEST_COMMAND}}`
+
+### Reglas
+
+- Nada se implementa si no está en la spec activa.
+- No avances de fase sin aprobación explícita del usuario.
+- Los cambios de requisitos se hacen primero en la spec, luego en el plan y las tareas, y por último en el código.
+- Test primero: no se avanza con tests en rojo.
+- Actualiza `MEMORY.md` al terminar cada tarea.
+- Sigue la skill `sdd` y los comandos `/sdd-*`.
+
+### Agentes
+
+- `coordinator`: orquesta el flujo completo.
+- `planner`: redacta la constitución, spec, plan y tareas.
+- `implementer`: implementa una tarea a la vez.
+- `reviewer`: revisa la spec y valida la implementación.
+
+<!-- init-agents:sdd:end -->
+AGENTS_BLOCK_EOF
+)"
+}
+
+generate_agents_md() {
+  local path="AGENTS.md"
+  local content
+
+  if [[ -f "$path" ]]; then
+    if $APPEND_AGENTS; then
+      if grep -qF "$MARKER_START" "$path"; then
+        if $DRY_RUN; then
+          info "  [dry-run] omitiría $path (bloque SDD ya presente)"
+        else
+          skipped "$path (bloque SDD ya presente)"
+          SKIPPED=$((SKIPPED + 1))
+        fi
+      elif $DRY_RUN; then
+        info "  [dry-run] anexaría el bloque SDD a $path"
+      else
+        [[ -s "$path" ]] && printf '\n' >>"$path"
+        render_agents_block >>"$path"
+        printf '\n' >>"$path"
+        ok "anexado bloque SDD a $path"
+        APPENDED=$((APPENDED + 1))
+      fi
+    elif $FORCE; then
+      if $DRY_RUN; then
+        info "  [dry-run] sobrescribiría $path"
+      else
+        content="$(render_agents_full)"
+        backup_file "$path"
+        printf '%s\n' "$content" >"$path"
+        ok "sobrescrito $path"
+        OVERWRITTEN=$((OVERWRITTEN + 1))
+      fi
+    else
+      skipped "$path (ya existe; usa --append-agents o --force)"
+      SKIPPED=$((SKIPPED + 1))
+    fi
+  else
+    content="$(render_agents_full)"
+    if $DRY_RUN; then
+      info "  [dry-run] crearía $path"
+    else
+      printf '%s\n' "$content" >"$path"
+      ok "creado $path"
+      CREATED=$((CREATED + 1))
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Generación de cada archivo
+# ---------------------------------------------------------------------------
+generate_file() {
+  local path="$1"
+
+  case "$path" in
+    "AGENTS.md")
+      generate_agents_md
+      ;;
+    "MEMORY.md")
+      render_file "$path" <<'MEMORY_EOF'
+# MEMORY.md — {{PROJECT_NAME}}
+
+Memoria del proyecto entre sesiones. Máximo ~50 líneas: resume o elimina lo que ya no aporte. No guardes datos sensibles.
+
+## Estado actual
+
+- {{DATE}} — Proyecto inicializado con el esquema SDD.
+
+## Decisiones (y por qué)
+
+- {{DATE}} — Se adopta Spec-Driven Development: constitución → spec → clarificación → plan → tareas → implementación → validación. Motivo: mantener la implementación alineada con requisitos verificables.
+
+## Aprendizajes y errores a evitar
+
+- (vacío por ahora)
+
+## Próximos pasos
+
+- Revisar `docs/constitution.md` y adaptarlo al proyecto.
+- Crear la primera spec con `/sdd-spec 001-nombre idea`.
+MEMORY_EOF
+      ;;
+    "docs/README.md")
+      render_file "$path" <<'DOCS_README_EOF'
+# Documentación
+
+- [`constitution.md`](constitution.md): principios innegociables del proyecto.
+{{GUIDE_LINK}}
+
+## Estructura
+
+- `specs/NNN-nombre/`: una carpeta por funcionalidad con `spec.md`, `plan.md` y `tasks.md`.
+- `tests/`: tests de integración/e2e y documentación de la estrategia de pruebas.
+- `.agents/skills/sdd/`: skill que define el flujo SDD.
+- `.opencode/agents/`: agentes del proyecto.
+- `.opencode/commands/`: comandos `/sdd-*`.
+
+Mantén esta documentación breve y actualizada. Si una decisión es permanente, conviértela en un principio de la constitución o en una regla de `AGENTS.md`.
+DOCS_README_EOF
+      ;;
+    "docs/constitution.md")
+      render_file "$path" <<'CONSTITUTION_EOF'
+# Constitución — {{PROJECT_NAME}}
+Principios innegociables. Toda spec, plan y tarea debe cumplirlos.
+
+1. **Simplicidad primero**: {{STACK}}. Sin dependencias ni pasos de build innecesarios. El proyecto debe poder ejecutarse con el mínimo de pasos y ser mantenible por alguien con conocimientos básicos.
+2. **La spec manda**: nada se implementa si no está en la spec activa. Si falta una decisión, se para y se pregunta.
+3. **Lógica separada de la interfaz**: los cálculos y reglas de negocio son funciones puras, sin acceso directo a la interfaz ni a la persistencia; reciben las dependencias externas (por ejemplo, "hoy") como parámetros.
+4. **Tests como puerta**: la lógica se prueba con `{{TEST_COMMAND}}`, sin instalar dependencias nuevas salvo aprobación explícita. Prohibido avanzar con tests en rojo.
+5. **Los datos del usuario son sagrados**: {{DATA_STORE}} con compatibilidad hacia atrás; si se manejan fechas, en la zona horaria del usuario. Nunca se pierde información.
+6. **Idioma**: código en {{CODE_LANGUAGE}}; interfaz y documentación en {{DOC_LANGUAGE}}.
+CONSTITUTION_EOF
+      ;;
+    "docs/sdd.md")
+      render_file "$path" <<'SDD_GUIDE_EOF'
+# Spec-Driven Development (SDD)
+
+Guía del flujo de trabajo de {{PROJECT_NAME}}. La skill `sdd` contiene las mismas reglas y plantillas para los agentes.
+
+## Principios
+
+- **La constitución manda**: ningún plan, tarea o cambio puede contradecir `docs/constitution.md`.
+- **La spec manda**: nada se implementa si no está en la spec activa. Si falta una decisión, se para y se pregunta.
+- **Una fase cada vez**: no se pasa a la siguiente fase sin aprobación explícita del usuario.
+- **Tests como puerta**: no se avanza con tests en rojo.
+- **Trazabilidad**: cada requisito funcional (`RF-x`) debe poder rastrearse hasta un test o una verificación manual.
+- **Cambios en orden**: primero la spec, luego el plan y las tareas, y por último el código.
+- **Memoria**: al terminar cada fase, actualiza `MEMORY.md` con hechos verificados y decisiones.
+
+## Flujo
+
+```text
+Constitución → Spec → Clarificación → Plan → Tareas → Implementación → Validación → Cambio
+```
+
+| Fase | Comando | Agente | Salida |
+|---|---|---|---|
+| Constitución | `/sdd-constitution` | `planner` | `docs/constitution.md` |
+| Spec | `/sdd-spec 001-nombre idea` | `planner` | `specs/001-nombre/spec.md` |
+| Clarificación | `/sdd-clarify 001-nombre` | `reviewer` | Lista de problemas |
+| Plan | `/sdd-plan 001-nombre` | `planner` | `specs/001-nombre/plan.md` |
+| Tareas | `/sdd-tasks 001-nombre` | `planner` | `specs/001-nombre/tasks.md` |
+| Implementación | `/sdd-implement 001-nombre T1` | `implementer` | Código + tests + tarea marcada |
+| Validación | `/sdd-validate 001-nombre` | `reviewer` | Veredicto RF por RF |
+| Cambio | `/sdd-change 001-nombre requisito` | `planner` | Diff de la spec |
+| Estado | `/sdd-status 001-nombre` | `planner` | Fase actual y siguiente paso |
+
+La clarificación puede repetirse después del plan y de las tareas si aparece una ambigüedad nueva.
+
+## Agentes
+
+| Agente | Rol |
+|---|---|
+| `coordinator` | Orquesta el flujo completo y transmite el contexto entre fases. No edita archivos. |
+| `planner` | Redacta la constitución, la spec, el plan y las tareas. No toca código. |
+| `implementer` | Implementa una sola tarea, con tests primero, y se detiene. |
+| `reviewer` | Revisa la spec como QA y valida la implementación RF por RF. No modifica archivos. |
+
+## Paso 1: Constitución
+
+Prompt de ejemplo:
+
+```text
+Vamos a crear la constitución de {{PROJECT_NAME}}. Es un proyecto que ya existe:
+lee AGENTS.md, MEMORY.md y el código antes de proponer nada.
+
+Proponme un docs/constitution.md con 6 principios innegociables, cortos y
+verificables, que cubran: simplicidad del stack, relación entre spec y código,
+separación entre lógica e interfaz, política de tests, protección de los datos
+del usuario e idioma del código y los textos. Máximo 15 líneas.
+
+Espera mi aprobación antes de escribir el archivo.
+```
+
+La constitución debe ser breve. Los seis principios de la plantilla generada son un punto de partida; adáptalos al proyecto.
+
+## Paso 2: Especificación
+
+Prompt de ejemplo:
+
+```text
+NO escribas código en ningún momento. Vamos a redactar la especificación de una
+nueva funcionalidad de {{PROJECT_NAME}}. Lee docs/constitution.md.
+
+Idea inicial: <describe la idea>.
+
+Tu trabajo:
+1. Hazme preguntas de UNA en UNA para eliminar ambigüedades (casos límite,
+   comportamiento con errores, qué queda fuera de esta versión). Máximo 5 preguntas.
+2. Con mis respuestas, genera specs/NNN-nombre/spec.md con esta estructura:
+   contexto y objetivo, usuarios, historias de usuario, requisitos funcionales
+   numerados (RF-x) con criterios de aceptación en notación EARS en español,
+   requisitos no funcionales, casos límite, fuera de alcance, criterios de
+   finalización y dudas abiertas marcadas como [NECESITA ACLARACIÓN].
+3. El QUÉ y el POR QUÉ. Nada de stack, arquitectura ni nombres de archivos:
+   eso irá en el plan.
+```
+
+Plantilla de spec:
+
+```markdown
+# Spec NNN — <Nombre de la funcionalidad>
+Estado: borrador
+
+## Contexto y objetivo
+<Qué problema resuelve y por qué merece la pena. Un párrafo.>
+
+## Usuarios / actores
+<Quién lo usa.>
+
+## Historias de usuario
+- HU-1. Como <rol>, quiero <acción> para <beneficio>.
+
+## Definiciones
+<Solo si hay términos que puedan interpretarse de varias formas.>
+
+## Requisitos funcionales
+- RF-1: CUANDO <evento>, EL SISTEMA <respuesta>.
+- RF-2: SI <condición no deseada>, ENTONCES EL SISTEMA <respuesta>.
+- RF-3: MIENTRAS <estado>, EL SISTEMA <respuesta>.
+- RF-4: EL SISTEMA <comportamiento permanente>.
+
+## Requisitos no funcionales
+<Solo los que apliquen: rendimiento, seguridad, plataformas, idioma...>
+
+## Casos límite
+<Vacíos, duplicados, datos corruptos, límites, concurrencia...>
+
+## Fuera de alcance
+<Lo que explícitamente NO se hace en esta iteración.>
+
+## Criterios de finalización
+<Ej.: todos los RF con test en verde + verificación manual del flujo principal.>
+
+## Dudas abiertas
+- [NECESITA ACLARACIÓN] <duda>
+```
+
+## Paso 3: Clarificación
+
+Prompt de ejemplo:
+
+```text
+Revisa specs/NNN-nombre/spec.md como si fueras un QA muy profesional.
+
+Lista:
+1. Ambigüedades restantes.
+2. Contradicciones entre requisitos.
+3. Casos límite no cubiertos.
+4. Conflictos con docs/constitution.md.
+
+No propongas soluciones todavía: solo detecta. Formato: lista numerada.
+```
+
+## Paso 4: Planificación
+
+Prompt de ejemplo:
+
+```text
+Lee docs/constitution.md y specs/NNN-nombre/spec.md. NO escribas código.
+
+Genera specs/NNN-nombre/plan.md con: qué archivos se crean o modifican y qué
+responsabilidad tiene cada uno, qué funciones puras de lógica se necesitan (con
+"hoy" como parámetro), algoritmo del flujo en pseudocódigo, cómo se pinta en la
+interfaz, decisiones técnicas justificadas (y su alternativa descartada) y
+estrategia de tests con {{TEST_COMMAND}}.
+
+Todo debe respetar la constitución y cubrir todos los RF. Marca qué RF cubre
+cada parte.
+```
+
+## Paso 5: Tareas
+
+Prompt de ejemplo:
+
+```text
+A partir de spec.md y plan.md, genera specs/NNN-nombre/tasks.md:
+tareas pequeñas (máx. 20-30 min cada una), en orden de dependencia, cada una
+con los RF que cubre y una línea "Hecho cuando:" verificable. Usa checkboxes.
+```
+
+Formato:
+
+```markdown
+- [ ] **T1. <Descripción>.** RF-1, RF-2
+  - Hecho cuando: <comprobación verificable>.
+```
+
+## Paso 6: Implementación
+
+Prompt de ejemplo:
+
+```text
+Implementa SOLO la tarea T1 de specs/NNN-nombre/tasks.md, siguiendo plan.md y
+la constitución. Escribe primero los tests, luego el código.
+
+Ejecuta {{TEST_COMMAND}} y muéstrame el resultado. Al terminar: marca T1 en
+tasks.md, indica qué RF cubre y PÁRATE. No empieces T2.
+```
+
+## Paso 7: Validación
+
+Prompt de ejemplo:
+
+```text
+Recorre specs/NNN-nombre/spec.md requisito por requisito. Para cada uno indica
+qué test lo cubre y el resultado de ejecutarlo con {{TEST_COMMAND}}.
+
+Los RF de interfaz que no se puedan testear automáticamente, verifícalos con
+{{UI_CHECK}}.
+
+Si algún RF no está cubierto o falla, dilo claramente. Después comprueba los
+criterios de finalización y dame un veredicto: ¿la spec está cumplida?
+```
+
+## Mantenimiento: cambios de requisitos
+
+1. Actualiza primero `spec.md` con el nuevo RF en EARS y sus casos límite.
+2. Revisa el diff y apruébalo.
+3. Actualiza `plan.md` y `tasks.md`.
+4. Implementa y valida.
+
+Comando:
+
+```text
+/sdd-change 001-nombre <nuevo requisito>
+```
+
+## Estado de una spec
+
+```text
+/sdd-status 001-nombre
+```
+
+Devuelve la fase actual, las tareas hechas y pendientes, y el siguiente comando recomendado.
+
+## Memoria
+
+- `MEMORY.md` guarda el estado actual, las decisiones importantes y los errores a evitar.
+- Mantenlo breve (máximo ~50 líneas).
+- No guardes secretos, claves ni datos personales.
+- Si algo se convierte en una regla permanente, muévelo a `AGENTS.md` o a la constitución.
+SDD_GUIDE_EOF
+      ;;
+    "specs/README.md")
+      render_file "$path" <<'SPECS_README_EOF'
+# Specs
+
+Cada funcionalidad vive en su propia carpeta:
+
+```text
+specs/
+└── NNN-nombre/
+    ├── spec.md
+    ├── plan.md
+    └── tasks.md
+```
+
+- `NNN`: número secuencial de tres dígitos (`001`, `002`, ...).
+- `nombre`: kebab-case, corto y descriptivo.
+- `spec.md`: el QUÉ y el POR QUÉ. Requisitos en EARS. Sin stack, arquitectura ni nombres de archivos.
+- `plan.md`: el CÓMO técnico. Archivos, funciones puras, algoritmo, interfaz, decisiones y tests.
+- `tasks.md`: tareas pequeñas (20-30 min), en orden de dependencia, con RF y "Hecho cuando:".
+
+Plantillas en [`_template/`](_template/).
+
+## Estados de una spec
+
+- `borrador`: en redacción o pendiente de aprobación.
+- `aprobada`: el usuario ha aprobado spec, plan y tareas.
+- `implementada`: todos los RF están cubiertos y los tests pasan.
+
+## Comandos
+
+| Fase | Comando |
+|---|---|
+| Crear spec | `/sdd-spec 001-nombre idea inicial` |
+| Clarificar | `/sdd-clarify 001-nombre` |
+| Planificar | `/sdd-plan 001-nombre` |
+| Crear tareas | `/sdd-tasks 001-nombre` |
+| Implementar una tarea | `/sdd-implement 001-nombre T1` |
+| Validar | `/sdd-validate 001-nombre` |
+| Cambiar requisitos | `/sdd-change 001-nombre nuevo requisito` |
+| Ver estado | `/sdd-status 001-nombre` |
+
+Sigue el flujo de {{GUIDE_REFERENCE}}.
+SPECS_README_EOF
+      ;;
+    "specs/_template/spec.md")
+      render_file "$path" <<'SPEC_TEMPLATE_EOF'
+# Spec NNN — <Nombre>
+Estado: borrador
+
+## Contexto y objetivo
+<Qué problema resuelve y por qué merece la pena. Un párrafo.>
+
+## Usuarios / actores
+<Quién lo usa.>
+
+## Historias de usuario
+- HU-1. Como <rol>, quiero <acción> para <beneficio>.
+
+## Definiciones
+<Solo si hay términos que puedan interpretarse de varias formas.>
+
+## Requisitos funcionales
+- RF-1: CUANDO <evento>, EL SISTEMA <respuesta>.
+- RF-2: SI <condición no deseada>, ENTONCES EL SISTEMA <respuesta>.
+- RF-3: MIENTRAS <estado>, EL SISTEMA <respuesta>.
+- RF-4: EL SISTEMA <comportamiento permanente>.
+
+## Requisitos no funcionales
+<Solo los que apliquen: rendimiento, seguridad, plataformas, idioma...>
+
+## Casos límite
+<Vacíos, duplicados, datos corruptos, límites, concurrencia...>
+
+## Fuera de alcance
+<Lo que explícitamente NO se hace en esta iteración.>
+
+## Criterios de finalización
+<Ej.: todos los RF con test en verde + verificación manual del flujo principal.>
+
+## Dudas abiertas
+- [NECESITA ACLARACIÓN] <duda>
+SPEC_TEMPLATE_EOF
+      ;;
+    "specs/_template/plan.md")
+      render_file "$path" <<'PLAN_TEMPLATE_EOF'
+# Plan NNN — <Nombre>
+
+Spec: `specs/NNN-nombre/spec.md`
+
+## Archivos y responsabilidades
+
+| Archivo | Acción | Responsabilidad | RF |
+|---|---|---|---|
+| `<archivo>` | Crear/Modificar | <responsabilidad> | RF-1 |
+
+## Funciones puras
+
+- `<funcion>(<parametros>, hoy)`: <qué calcula y qué devuelve>. RF-x.
+
+## Algoritmo (pseudocódigo)
+
+```text
+<pasos del algoritmo>
+```
+
+## Interfaz
+
+<Cómo se pinta y qué eventos gestiona.>
+
+## Decisiones técnicas
+
+- **Decisión**: <...>
+  - Motivo: <...>
+  - Alternativa descartada: <...>
+
+## Estrategia de tests (`{{TEST_COMMAND}}`)
+
+- <Caso> → <test> → RF-x.
+
+## Cobertura de requisitos
+
+| RF | Dónde se cubre |
+|---|---|
+| RF-1 | <archivo/función/test> |
+PLAN_TEMPLATE_EOF
+      ;;
+    "specs/_template/tasks.md")
+      render_file "$path" <<'TASKS_TEMPLATE_EOF'
+# Tareas NNN — <Nombre>
+
+- [ ] **T1. <Descripción>.** RF-1, RF-2
+  - Hecho cuando: <comprobación verificable>.
+- [ ] **T2. <Descripción>.** RF-3
+  - Hecho cuando: <comprobación verificable>.
+TASKS_TEMPLATE_EOF
+      ;;
+    "tests/README.md")
+      render_file "$path" <<'TESTS_README_EOF'
+# Tests
+
+Comando de tests: `{{TEST_COMMAND}}`
+
+## Convenciones
+
+- Los tests de lógica pura pueden vivir aquí o junto al código, según el stack.
+- Los tests de integración/e2e viven en `tests/`.
+- Cada requisito funcional (`RF-x`) debe tener al menos un test o una verificación manual documentada.
+- No se avanza con tests en rojo.
+- Si no hay tests automáticos, documenta cómo verificar manualmente cada RF con {{UI_CHECK}}.
+
+## Estructura sugerida
+
+```text
+tests/
+├── unit/          # si no viven junto al código
+├── integration/
+└── e2e/
+```
+
+## Verificación visual
+
+- {{UI_CHECK}}.
+TESTS_README_EOF
+      ;;
+    ".agents/skills/sdd/SKILL.md")
+      render_file "$path" <<'SKILL_EOF'
+---
+name: sdd
+description: >-
+  Úsala siempre que trabajes con Spec-Driven Development en este proyecto
+  (docs/constitution.md o cualquier archivo dentro de specs/): redactar,
+  revisar o cambiar specs, planes y tareas, o implementar y validar tareas
+  de una spec.
+---
+
+# Spec-Driven Development (SDD)
+
+## Flujo
+
+Constitución → Spec → Clarificación → Plan → Tareas → Implementación → Validación → Cambio.
+
+- Nunca pases a la siguiente fase sin la aprobación explícita del usuario.
+- La spec manda: si algo no está en la spec, no se implementa. Si falta una decisión, para y pregunta.
+- Un cambio de requisitos se hace primero en la spec, luego en el plan y las tareas, y por último en el código.
+- Cada spec vive en su carpeta: `specs/NNN-nombre/` con `spec.md`, `plan.md` y `tasks.md`.
+- Al terminar cada fase, actualiza `MEMORY.md` con hechos verificados y decisiones.
+- Usa las plantillas de `specs/_template/` y `docs/constitution.md` como referencia.
+
+## Comandos
+
+| Fase | Comando |
+|---|---|
+| Constitución | `/sdd-constitution` |
+| Spec | `/sdd-spec 001-nombre idea` |
+| Clarificación | `/sdd-clarify 001-nombre` |
+| Plan | `/sdd-plan 001-nombre` |
+| Tareas | `/sdd-tasks 001-nombre` |
+| Implementación | `/sdd-implement 001-nombre T1` |
+| Validación | `/sdd-validate 001-nombre` |
+| Cambio | `/sdd-change 001-nombre requisito` |
+| Estado | `/sdd-status 001-nombre` |
+
+## Plantilla de spec (spec.md)
+
+```markdown
+# Spec NNN — <Nombre>
+Estado: borrador | aprobada | implementada
+
+## Contexto y objetivo
+## Usuarios
+## Historias de usuario
+- HU-1. Como <rol>, quiero <acción> para <beneficio>.
+## Definiciones (solo si hay términos que puedan interpretarse de varias formas)
+## Requisitos funcionales
+## Requisitos no funcionales
+## Casos límite
+## Fuera de alcance
+## Criterios de finalización
+## Dudas abiertas
+- [NECESITA ACLARACIÓN] <duda>
+```
+
+La spec describe el QUÉ y el POR QUÉ. Nada de stack, arquitectura ni nombres de archivos.
+
+## Requisitos en EARS (en español)
+
+- RF-x: CUANDO <evento>, EL SISTEMA <respuesta>.
+- RF-x: SI <condición no deseada>, ENTONCES EL SISTEMA <respuesta>.
+- RF-x: MIENTRAS <estado>, EL SISTEMA <respuesta>.
+- RF-x: EL SISTEMA <comportamiento permanente>.
+
+Cada RF debe ser verificable: nada de "rápido", "intenso" o "bonito" sin un criterio medible.
+
+## Plan (plan.md)
+
+Archivos y responsabilidades · Funciones puras (con "hoy" como parámetro) · Algoritmo en pseudocódigo · Interfaz · Decisiones justificadas con su alternativa descartada · Estrategia de tests con `{{TEST_COMMAND}}`. Indica qué RF cubre cada parte.
+
+## Tareas (tasks.md)
+
+```markdown
+- [ ] **Tn. <Descripción>.** RF-x, RF-y
+  - Hecho cuando: <comprobación verificable>.
+```
+
+Máximo 20-30 min por tarea, en orden de dependencia. Si salen más de 10, propón dividir la spec.
+
+## Implementación
+
+Una sola tarea cada vez: tests primero (en rojo), después el código, `{{TEST_COMMAND}}` en verde, marcar la tarea y parar.
+
+## Validación
+
+- Recorre cada RF: qué test lo cubre y el resultado.
+- Los RF de interfaz que no se puedan automatizar se verifican con {{UI_CHECK}}.
+- Comprueba los criterios de finalización y la constitución.
+- Veredicto: `APROBADO` o `CAMBIOS NECESARIOS`.
+
+## Cambios
+
+Primero se actualiza la spec, luego el plan y las tareas, y por último el código.
+SKILL_EOF
+      ;;
+    ".opencode/agents/coordinator.md")
+      render_file "$path" <<'COORDINATOR_EOF'
+---
+description: 'SDD - coordina el flujo completo con planner, implementer y reviewer, y transmite el contexto entre fases'
+mode: primary
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "planner"
+    effect: allow
+  - action: subagent
+    resource: "implementer"
+    effect: allow
+  - action: subagent
+    resource: "reviewer"
+    effect: allow
+---
+
+Eres el agente coordinador (coordinator) de {{PROJECT_NAME}}. No escribes código ni editas archivos: diriges el flujo SDD (skill `sdd`) repartiendo el trabajo entre tres subagentes y hablas con el usuario.
+
+Antes de empezar, lee `AGENTS.md`, `MEMORY.md`, `docs/constitution.md` y la spec activa si existe.
+
+## Fases (flujo SDD)
+
+1. **Spec**: pide al subagente `planner` que redacte `specs/NNN-nombre/spec.md`. Si devuelve preguntas, házselas al usuario de una en una y vuelve a llamarle con las respuestas.
+2. **Clarificación**: pide al subagente `reviewer` que revise la spec como QA (solo detecta). Enseña el resultado al usuario; si hay problemas, `planner` corrige la spec. PARA hasta que el usuario apruebe la spec.
+3. **Plan y tareas**: pide a `planner` `plan.md` y `tasks.md` de la spec aprobada. Enseña un resumen y PARA hasta que el usuario los apruebe.
+4. **Implementación**: llama a `implementer` UNA vez por tarea (T1, T2...), en orden. Tras cada tarea revisa el resultado de `{{TEST_COMMAND}}` que reporta `implementer`; si no está en verde, para y avisa al usuario.
+5. **Validación**: pide a `reviewer` que valide la spec RF por RF.
+6. **Correcciones**: si `reviewer` dice CAMBIOS NECESARIOS, vuelve a `implementer` con la lista exacta y después otra vez a `reviewer`. Máximo 2 vueltas; si sigue fallando, para y explica al usuario qué ocurre.
+7. **Cierre**: resume qué se ha hecho, el veredicto de `reviewer` y lo pendiente.
+
+## Cambios de requisitos
+
+Si el usuario pide un cambio sobre una spec existente: primero `planner` actualiza `spec.md` y enseñas el diff; con la aprobación, se actualizan `plan.md` y `tasks.md`; después se implementa.
+
+## Transmitir el contexto
+
+Los subagentes NO ven esta conversación. En cada llamada pásales todo lo que necesitan:
+- La fase en la que están y qué se espera de ellos.
+- La petición original del usuario, con sus palabras, y sus decisiones.
+- Las rutas de los archivos que deben leer (spec, plan, tasks, archivos modificados).
+- El resultado de la fase anterior.
+
+## Reglas
+
+- Nunca te saltes una aprobación del usuario (spec, y plan con tareas).
+- No resuelvas tú las dudas: pregunta al usuario.
+- Informa al usuario en una línea al empezar cada fase.
+- No edites archivos: si hay que actualizar `MEMORY.md`, pídeselo a `planner` o `implementer`.
+COORDINATOR_EOF
+      ;;
+    ".opencode/agents/planner.md")
+      render_file "$path" <<'PLANNER_EOF'
+---
+description: 'SDD - redacta la constitución, la spec, el plan y las tareas, sin tocar código'
+mode: all
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: edit
+    resource: "specs/**"
+    effect: allow
+  - action: edit
+    resource: "docs/**"
+    effect: allow
+  - action: edit
+    resource: "MEMORY.md"
+    effect: allow
+  - action: shell
+    resource: "*"
+    effect: deny
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+---
+
+Eres el agente planificador (planner) de {{PROJECT_NAME}}. Redactas la constitución, specs, planes y tareas siguiendo la skill `sdd`. Nunca escribes código.
+
+## Antes de empezar
+
+Lee `docs/constitution.md`, `AGENTS.md`, `MEMORY.md` y el código afectado. Solo puedes escribir en `specs/`, `docs/` y `MEMORY.md`.
+
+## Constitución
+
+- Si te piden crear o revisar `docs/constitution.md`, propón 6 principios innegociables, cortos y verificables, que cubran: simplicidad del stack, relación entre spec y código, separación entre lógica e interfaz, política de tests, protección de los datos del usuario e idioma del código y los textos.
+- Máximo 15 líneas.
+- NO escribas el archivo hasta que el usuario apruebe la propuesta. Cuando apruebe, escribe `docs/constitution.md` y actualiza `MEMORY.md`.
+
+## Si te piden la spec
+
+- Si la petición es ambigua, no supongas: devuelve solo una lista numerada de preguntas (máximo 5).
+- Con las respuestas, crea `specs/NNN-nombre/spec.md` (NNN = siguiente número libre, salvo que el usuario indique la carpeta) con la plantilla de la skill `sdd`, requisitos en EARS y `Estado: borrador`.
+- Solo el QUÉ y el POR QUÉ: nada de stack, arquitectura ni nombres de archivos.
+- Cuando el usuario apruebe la spec, cambia su estado a `aprobada` y actualiza `MEMORY.md`.
+
+## Si te piden el plan y las tareas
+
+- Parte de la spec aprobada. Si la spec no está aprobada o tiene dudas abiertas, para y avísame.
+- Genera `plan.md` (archivos, funciones puras con "hoy" como parámetro, decisiones con la alternativa descartada, estrategia de tests con `{{TEST_COMMAND}}`, qué RF cubre cada parte).
+- Genera `tasks.md`: máximo 10 tareas, en orden, cada una con sus RF y "Hecho cuando:".
+- Actualiza `MEMORY.md`.
+
+## Si te piden un cambio
+
+Actualiza primero `spec.md` (nuevo RF en EARS + casos límite) y devuelve el diff. No toques `plan.md` ni `tasks.md` hasta que te lo pidan.
+
+## Respuesta
+
+Devuelve las rutas de los archivos creados o modificados y un resumen de 5 líneas como máximo (o la lista de preguntas).
+PLANNER_EOF
+      ;;
+    ".opencode/agents/implementer.md")
+      render_file "$path" <<'IMPLEMENTER_EOF'
+---
+description: 'SDD - implementa UNA tarea de un plan aprobado, con tests primero'
+mode: all
+permissions:
+  - action: edit
+    resource: "*"
+    effect: allow
+  - action: edit
+    resource: ".opencode/**"
+    effect: deny
+  - action: edit
+    resource: ".agents/**"
+    effect: deny
+  - action: edit
+    resource: "AGENTS.md"
+    effect: deny
+  - action: edit
+    resource: "docs/constitution.md"
+    effect: deny
+  - action: edit
+    resource: "specs/**"
+    effect: deny
+  - action: edit
+    resource: "specs/**/tasks.md"
+    effect: allow
+  - action: shell
+    resource: "*"
+    effect: allow
+  - action: shell
+    resource: "git push *"
+    effect: deny
+  - action: shell
+    resource: "git reset --hard *"
+    effect: deny
+  - action: shell
+    resource: "git clean *"
+    effect: deny
+  - action: shell
+    resource: "sudo *"
+    effect: deny
+  - action: shell
+    resource: "rm -rf *"
+    effect: deny
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+---
+
+Eres el agente implementador (implementer) de {{PROJECT_NAME}}. Ejecutas UNA tarea de un plan aprobado: no lo rediseñas.
+
+## Cómo trabajas
+
+- Lee la tarea que te indiquen en `specs/NNN-nombre/tasks.md`, su `plan.md`, `docs/constitution.md` y `AGENTS.md`.
+- Implementa SOLO esa tarea. En la lógica: primero los tests (en rojo) y después el código.
+- Ejecuta `{{TEST_COMMAND}}`. Nunca des la tarea por hecha con tests en rojo.
+- Si hay cambios visuales, verifícalos con {{UI_CHECK}}.
+- Marca la tarea como hecha en `tasks.md` y PARA. No empieces la siguiente.
+- Si la tarea o el plan son incorrectos o imposibles, PARA y explícalo. No improvises una solución distinta.
+- Si es la última tarea de la spec, actualiza `MEMORY.md`.
+- No modifiques `AGENTS.md`, `docs/constitution.md`, `specs/**/spec.md`, `specs/**/plan.md`, `.opencode/` ni `.agents/`.
+
+## Respuesta
+
+Devuelve:
+1. Tarea completada y RF que cubre.
+2. Archivos modificados.
+3. Resultado de `{{TEST_COMMAND}}`.
+4. Cualquier decisión que el plan no cubría.
+IMPLEMENTER_EOF
+      ;;
+    ".opencode/agents/reviewer.md")
+      render_file "$path" <<'REVIEWER_EOF'
+---
+description: 'SDD - revisa la spec como QA y valida la implementación RF por RF, sin modificar nada'
+mode: all
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: ask
+  - action: shell
+    resource: '{{TEST_COMMAND_YAML}}*'
+    effect: allow
+  - action: shell
+    resource: "git diff*"
+    effect: allow
+  - action: shell
+    resource: "git status*"
+    effect: allow
+  - action: shell
+    resource: "git log*"
+    effect: allow
+  - action: shell
+    resource: "git show*"
+    effect: allow
+  - action: webfetch
+    resource: "*"
+    effect: deny
+  - action: websearch
+    resource: "*"
+    effect: deny
+  - action: subagent
+    resource: "*"
+    effect: deny
+---
+
+Eres el agente revisor (reviewer) de {{PROJECT_NAME}}. Revisas sin modificar nunca ningún archivo. Sigues la skill `sdd`.
+
+## Si te piden revisar una spec (clarificación)
+
+Revísala como un QA muy profesional y lista:
+1. Ambigüedades.
+2. Contradicciones entre requisitos.
+3. Casos límite no cubiertos.
+4. Conflictos con `docs/constitution.md`.
+
+Solo detecta: no propongas soluciones.
+
+## Si te piden validar la implementación
+
+1. Lee `spec.md`, `plan.md` y `tasks.md`, y los cambios (usa `git diff`).
+2. Ejecuta `{{TEST_COMMAND}}`.
+3. Recorre la spec RF por RF: qué test lo cubre y su resultado. Los RF de interfaz, verifícalos con {{UI_CHECK}}.
+4. Comprueba los criterios de finalización, `docs/constitution.md` y las reglas de fechas de la constitución.
+
+Empieza siempre con una de estas dos líneas:
+- VEREDICTO: APROBADO
+- VEREDICTO: CAMBIOS NECESARIOS
+
+Si hay cambios necesarios, una lista numerada con: `archivo:línea`, qué incumple (tarea, RF o principio) y qué se espera. Las sugerencias que no incumplen la spec van aparte, en "Opcional", y no bloquean.
+REVIEWER_EOF
+      ;;
+    ".opencode/commands/sdd-constitution.md")
+      render_file "$path" <<'CMD_CONSTITUTION_EOF'
+---
+description: 'SDD · Propone la constitución del proyecto (principios innegociables)'
+agent: planner
+subagent: false
+---
+
+Vamos a crear (o revisar, si ya existe) `docs/constitution.md`. Usa la skill `sdd`.
+
+Antes de proponer nada, lee `AGENTS.md`, `MEMORY.md` y el código del proyecto.
+
+Contexto adicional: $ARGUMENTS
+
+Proponme 6 principios innegociables, cortos y verificables, que cubran:
+simplicidad del stack, relación entre spec y código, separación entre lógica
+e interfaz, política de tests, protección de los datos del usuario e idioma
+del código y los textos. Máximo 15 líneas.
+
+NO escribas el archivo todavía: espera mi aprobación. Cuando apruebe, escribe
+`docs/constitution.md` y actualiza `MEMORY.md`.
+CMD_CONSTITUTION_EOF
+      ;;
+    ".opencode/commands/sdd-spec.md")
+      render_file "$path" <<'CMD_SPEC_EOF'
+---
+description: 'SDD · Entrevista y genera la spec (uso: /sdd-spec 002-nombre idea inicial)'
+agent: planner
+subagent: false
+---
+
+NO escribas código en ningún momento. Lee `docs/constitution.md` y `MEMORY.md`, y usa la skill `sdd`.
+
+Carpeta de la spec: `specs/$1/`
+Idea inicial: $2
+
+Si falta `$1`, pide el nombre de la carpeta y no escribas nada. Si falta `$2`,
+pide la idea inicial.
+
+Tu trabajo:
+1. Hazme preguntas de UNA en UNA para eliminar ambigüedades (casos límite,
+   errores, qué queda fuera de esta versión). Máximo 5 preguntas.
+2. Con mis respuestas, genera `specs/$1/spec.md` siguiendo la plantilla de la
+   skill `sdd`, con los requisitos en EARS y `Estado: borrador`.
+3. Solo el QUÉ y el POR QUÉ: nada de stack, arquitectura ni nombres de archivos.
+4. Cuando apruebe la spec, cambia su estado a `aprobada` y actualiza `MEMORY.md`.
+CMD_SPEC_EOF
+      ;;
+    ".opencode/commands/sdd-clarify.md")
+      render_file "$path" <<'CMD_CLARIFY_EOF'
+---
+description: 'SDD · Revisa la spec como un QA (solo detecta, no resuelve)'
+agent: reviewer
+subagent: false
+---
+
+Revisa `specs/$1/spec.md` como si fueras un QA muy profesional. Usa la skill `sdd`.
+
+Si falta `$1`, pide el nombre de la carpeta.
+
+Lista:
+1. Ambigüedades restantes (requisitos que no se pueden verificar).
+2. Contradicciones entre requisitos.
+3. Casos límite no cubiertos.
+4. Conflictos con `docs/constitution.md`.
+
+No propongas soluciones todavía: solo detecta. Formato: lista numerada.
+No modifiques ningún archivo.
+CMD_CLARIFY_EOF
+      ;;
+    ".opencode/commands/sdd-plan.md")
+      render_file "$path" <<'CMD_PLAN_EOF'
+---
+description: 'SDD · Genera el plan técnico de una spec aprobada'
+agent: planner
+subagent: false
+---
+
+Lee `docs/constitution.md`, `AGENTS.md` y `specs/$1/spec.md`. Usa la skill `sdd`.
+
+Si falta `$1`, pide el nombre de la carpeta.
+
+NO escribas código.
+
+Genera `specs/$1/plan.md` con: archivos que se crean o modifican y la
+responsabilidad de cada uno, funciones puras de lógica (con "hoy" como
+parámetro), algoritmo en pseudocódigo, cómo se pinta en la interfaz,
+decisiones técnicas justificadas (con su alternativa descartada) y estrategia
+de tests con `{{TEST_COMMAND}}`.
+
+Todo debe respetar la constitución y cubrir todos los RF. Marca qué RF cubre
+cada parte. Si la spec no está aprobada o tiene dudas abiertas, para y avísame.
+Actualiza `MEMORY.md`.
+CMD_PLAN_EOF
+      ;;
+    ".opencode/commands/sdd-tasks.md")
+      render_file "$path" <<'CMD_TASKS_EOF'
+---
+description: 'SDD · Divide el plan en tareas pequeñas y verificables'
+agent: planner
+subagent: false
+---
+
+A partir de `specs/$1/spec.md` y `specs/$1/plan.md`, genera `specs/$1/tasks.md`
+siguiendo el formato de la skill `sdd`.
+
+Si falta `$1`, pide el nombre de la carpeta.
+
+- Tareas pequeñas (máx. 20-30 min cada una), en orden de dependencia.
+- Cada una con los RF que cubre y una línea "Hecho cuando:" verificable.
+- Checkboxes.
+- Intenta que no sean más de 10: si salen más, propón dividir la spec.
+
+Actualiza `MEMORY.md`.
+CMD_TASKS_EOF
+      ;;
+    ".opencode/commands/sdd-implement.md")
+      render_file "$path" <<'CMD_IMPLEMENT_EOF'
+---
+description: 'SDD · Implementa UNA tarea, tests primero (uso: /sdd-implement 002-nombre T3)'
+agent: implementer
+subagent: false
+---
+
+Implementa SOLO la tarea `$2` de `specs/$1/tasks.md`, siguiendo
+`specs/$1/plan.md`, `docs/constitution.md` y la skill `sdd`.
+
+Si falta `$1` o `$2`, pide los datos y no escribas nada.
+
+1. Escribe primero los tests y comprueba que fallan.
+2. Escribe el código hasta que pasen.
+3. Ejecuta `{{TEST_COMMAND}}` y muéstrame el resultado.
+4. Marca `$2` como hecha en `tasks.md` e indica qué RF cubre.
+
+Después PÁRATE. No empieces la siguiente tarea.
+CMD_IMPLEMENT_EOF
+      ;;
+    ".opencode/commands/sdd-validate.md")
+      render_file "$path" <<'CMD_VALIDATE_EOF'
+---
+description: 'SDD · Valida la spec RF por RF (tests + verificación visual)'
+agent: reviewer
+subagent: false
+---
+
+Recorre `specs/$1/spec.md` requisito por requisito. Para cada RF indica qué test
+lo cubre y el resultado de ejecutarlo con `{{TEST_COMMAND}}`.
+
+Si falta `$1`, pide el nombre de la carpeta.
+
+Los RF de interfaz que no se puedan testear automáticamente, verifícalos con
+`{{UI_CHECK}}`.
+
+Si algún RF no está cubierto o falla, dilo claramente. NO arregles nada todavía.
+Después comprueba los criterios de finalización y dame un veredicto:
+¿la spec está cumplida?
+CMD_VALIDATE_EOF
+      ;;
+    ".opencode/commands/sdd-change.md")
+      render_file "$path" <<'CMD_CHANGE_EOF'
+---
+description: 'SDD · Nuevo requisito: primero la spec, luego el código'
+agent: planner
+subagent: false
+---
+
+Nuevo requisito para la spec `specs/$1/`: $2
+
+Si falta `$1` o `$2`, pide los datos y no escribas nada.
+
+NO toques código. Usa la skill `sdd`.
+
+1. Actualiza `specs/$1/spec.md`: nuevo RF (o cambio de uno existente) en EARS,
+   sus casos límite y lo que queda fuera de alcance.
+2. Indica qué partes de `plan.md` y `tasks.md` habría que cambiar después.
+3. Muéstrame el diff de la spec y espera mi aprobación.
+
+Actualiza `MEMORY.md` cuando el cambio esté aprobado.
+CMD_CHANGE_EOF
+      ;;
+    ".opencode/commands/sdd-status.md")
+      render_file "$path" <<'CMD_STATUS_EOF'
+---
+description: 'SDD · Dónde estamos: fase actual y siguiente paso de una spec'
+agent: planner
+subagent: false
+---
+
+Lee `specs/$1/` (spec.md, plan.md y tasks.md, los que existan) y `MEMORY.md`.
+
+Si falta `$1`, pide el nombre de la carpeta.
+
+Dime en pocas líneas:
+1. En qué fase del flujo SDD está esta spec y su estado.
+2. Tareas hechas y pendientes (x de y).
+3. El siguiente paso exacto, con el comando `/sdd-*` que debo ejecutar.
+
+No modifiques ningún archivo.
+CMD_STATUS_EOF
+      ;;
+    *)
+      die "Ruta desconocida en el generador: $path"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Argumentos
+# ---------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)
+        [[ $# -ge 2 ]] || die "Falta el valor de --name."
+        PROJECT_NAME="$2"
+        shift 2
+        ;;
+      --description)
+        [[ $# -ge 2 ]] || die "Falta el valor de --description."
+        PROJECT_DESCRIPTION="$2"
+        shift 2
+        ;;
+      --stack)
+        [[ $# -ge 2 ]] || die "Falta el valor de --stack."
+        STACK="$2"
+        shift 2
+        ;;
+      --test-command)
+        [[ $# -ge 2 ]] || die "Falta el valor de --test-command."
+        TEST_COMMAND="$2"
+        shift 2
+        ;;
+      --data-store)
+        [[ $# -ge 2 ]] || die "Falta el valor de --data-store."
+        DATA_STORE="$2"
+        shift 2
+        ;;
+      --ui-check)
+        [[ $# -ge 2 ]] || die "Falta el valor de --ui-check."
+        UI_CHECK="$2"
+        shift 2
+        ;;
+      --code-language)
+        [[ $# -ge 2 ]] || die "Falta el valor de --code-language."
+        CODE_LANGUAGE="$2"
+        shift 2
+        ;;
+      --doc-language)
+        [[ $# -ge 2 ]] || die "Falta el valor de --doc-language."
+        DOC_LANGUAGE="$2"
+        shift 2
+        ;;
+      -y | --yes)
+        ASSUME_YES=true
+        shift
+        ;;
+      -f | --force)
+        FORCE=true
+        shift
+        ;;
+      --append-agents)
+        APPEND_AGENTS=true
+        shift
+        ;;
+      --no-guide)
+        NO_GUIDE=true
+        shift
+        ;;
+      -n | --dry-run)
+        DRY_RUN=true
+        shift
+        ;;
+      --list)
+        LIST_ONLY=true
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -v | --version)
+        printf '%s\n' "$VERSION"
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Opción desconocida: $1. Usa --help."
+        ;;
+      *)
+        die "Argumento no esperado: $1. El script se ejecuta en el directorio actual."
+        ;;
+    esac
+  done
+
+  if $FORCE && $APPEND_AGENTS; then
+    die "--force y --append-agents son mutuamente excluyentes."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Principal
+# ---------------------------------------------------------------------------
+main() {
+  if ((BASH_VERSINFO[0] < 4)); then
+    die "Se requiere Bash 4 o superior."
+  fi
+
+  local cwd home_real
+  cwd="$(pwd -P)"
+  home_real="$(cd "${HOME:-/nonexistent}" 2>/dev/null && pwd -P || printf '%s' "${HOME:-/nonexistent}")"
+  [[ "$cwd" == "/" ]] && die "No se puede ejecutar en /. Entra en la carpeta del proyecto."
+  [[ "$cwd" == "$home_real" ]] && die "No se puede ejecutar en \$HOME. Entra en la carpeta del proyecto."
+  [[ -w "$cwd" ]] || die "El directorio actual no es escribible."
+
+  TOTAL_FILES="$(list_files | wc -l | tr -d ' ')"
+
+  if $LIST_ONLY; then
+    list_files
+    exit 0
+  fi
+
+  # Valores detectados
+  PROJECT_NAME="${PROJECT_NAME:-$(detect_project_name)}"
+  PROJECT_DESCRIPTION="${PROJECT_DESCRIPTION:-$(detect_description)}"
+  STACK="${STACK:-$(detect_stack)}"
+  TEST_COMMAND="${TEST_COMMAND:-$(detect_test_command)}"
+  DATA_STORE="${DATA_STORE:-$(detect_data_store)}"
+  UI_CHECK="${UI_CHECK:-$(detect_ui_check)}"
+  CODE_LANGUAGE="${CODE_LANGUAGE:-inglés}"
+  DOC_LANGUAGE="${DOC_LANGUAGE:-español}"
+
+  if ! $ASSUME_YES && [[ -t 0 ]]; then
+    info "Configuración del proyecto (Enter para aceptar el valor entre corchetes):"
+    ask_var PROJECT_NAME "  Nombre del proyecto" "$PROJECT_NAME"
+    ask_var PROJECT_DESCRIPTION "  Descripción breve" "$PROJECT_DESCRIPTION"
+    ask_var STACK "  Stack principal" "$STACK"
+    ask_var TEST_COMMAND "  Comando de tests" "$TEST_COMMAND"
+    ask_var DATA_STORE "  Persistencia de datos" "$DATA_STORE"
+    ask_var UI_CHECK "  Verificación visual" "$UI_CHECK"
+    ask_var CODE_LANGUAGE "  Idioma del código" "$CODE_LANGUAGE"
+    ask_var DOC_LANGUAGE "  Idioma de documentación e interfaz" "$DOC_LANGUAGE"
+    info ""
+  fi
+
+  [[ -z "$PROJECT_NAME" ]] && PROJECT_NAME="$(detect_project_name)"
+  [[ -z "$PROJECT_DESCRIPTION" ]] && PROJECT_DESCRIPTION="$(detect_description)"
+  [[ -z "$STACK" ]] && STACK="$(detect_stack)"
+  [[ -z "$TEST_COMMAND" ]] && TEST_COMMAND="no definido"
+  [[ -z "$DATA_STORE" ]] && DATA_STORE="la persistencia del proyecto"
+  [[ -z "$UI_CHECK" ]] && UI_CHECK="no aplica"
+  [[ -z "$CODE_LANGUAGE" ]] && CODE_LANGUAGE="inglés"
+  [[ -z "$DOC_LANGUAGE" ]] && DOC_LANGUAGE="español"
+
+  validate_value "Nombre del proyecto" "$PROJECT_NAME"
+  validate_value "Descripción" "$PROJECT_DESCRIPTION"
+  validate_value "Stack" "$STACK"
+  validate_value "Comando de tests" "$TEST_COMMAND"
+  validate_value "Persistencia" "$DATA_STORE"
+  validate_value "Verificación visual" "$UI_CHECK"
+  validate_value "Idioma del código" "$CODE_LANGUAGE"
+  validate_value "Idioma de documentación" "$DOC_LANGUAGE"
+
+  TEST_COMMAND_YAML="${TEST_COMMAND//\'/\'\'}"
+  if $NO_GUIDE; then
+    GUIDE_LINK=""
+    # shellcheck disable=SC2016 # Las comillas invertidas son Markdown, no sustitución.
+    GUIDE_REFERENCE='la skill `sdd`'
+  else
+    # shellcheck disable=SC2016 # Las comillas invertidas son Markdown, no sustitución.
+    GUIDE_LINK='- [`sdd.md`](sdd.md): guía del flujo Spec-Driven Development, comandos y ejemplos.'
+    # shellcheck disable=SC2016 # Las comillas invertidas son Markdown, no sustitución.
+    GUIDE_REFERENCE='`docs/sdd.md` y la skill `sdd`'
+  fi
+  PROJECT_NAME_ESC="$(escape_replacement "$PROJECT_NAME")"
+  PROJECT_DESCRIPTION_ESC="$(escape_replacement "$PROJECT_DESCRIPTION")"
+  STACK_ESC="$(escape_replacement "$STACK")"
+  TEST_COMMAND_ESC="$(escape_replacement "$TEST_COMMAND")"
+  TEST_COMMAND_YAML_ESC="$(escape_replacement "$TEST_COMMAND_YAML")"
+  DATA_STORE_ESC="$(escape_replacement "$DATA_STORE")"
+  UI_CHECK_ESC="$(escape_replacement "$UI_CHECK")"
+  CODE_LANGUAGE_ESC="$(escape_replacement "$CODE_LANGUAGE")"
+  DOC_LANGUAGE_ESC="$(escape_replacement "$DOC_LANGUAGE")"
+  GUIDE_LINK_ESC="$(escape_replacement "$GUIDE_LINK")"
+  GUIDE_REFERENCE_ESC="$(escape_replacement "$GUIDE_REFERENCE")"
+
+  info "Resumen:"
+  info "  Proyecto:        $PROJECT_NAME"
+  info "  Descripción:     $PROJECT_DESCRIPTION"
+  info "  Stack:           $STACK"
+  info "  Tests:           $TEST_COMMAND"
+  info "  Persistencia:    $DATA_STORE"
+  info "  Verificación:    $UI_CHECK"
+  info "  Código:          $CODE_LANGUAGE"
+  info "  Documentación:   $DOC_LANGUAGE"
+  info ""
+
+  if ! $ASSUME_YES && [[ -t 0 ]]; then
+    local answer
+    local verb="Generar"
+    $DRY_RUN && verb="Simular"
+    read -r -p "¿$verb $TOTAL_FILES archivos? [S/n]: " answer || true
+    case "$answer" in
+      n | N | no | NO | No) info "Cancelado."; exit 0 ;;
+    esac
+    info ""
+  fi
+
+  info "Generando estructura SDD en: $PWD"
+  info ""
+
+  local path
+  while IFS= read -r path; do
+    generate_file "$path"
+  done < <(list_files)
+
+  info ""
+  info "Resumen:"
+  info "  Archivos planificados: $TOTAL_FILES"
+  info "  Creados:               $CREATED"
+  info "  Omitidos:              $SKIPPED"
+  info "  Sobrescritos:          $OVERWRITTEN"
+  info "  Anexados:              $APPENDED"
+
+  if $DRY_RUN; then
+    info ""
+    info "Simulación completada: no se ha escrito nada."
+    exit 0
+  fi
+
+  local unresolved
+  unresolved="$(grep -RIn --include='*.md' -E '\{\{[A-Z_]+\}\}' AGENTS.md MEMORY.md docs specs tests .agents .opencode 2>/dev/null || true)"
+  if [[ -n "$unresolved" ]]; then
+    warn "Placeholders sin sustituir:"
+    printf '%s\n' "$unresolved" >&2
+  fi
+
+  info ""
+  info "Siguiente:"
+  info "  1. Revisa docs/constitution.md y AGENTS.md."
+  info "  2. Ejecuta /sdd-spec 001-mi-idea <descripción> en OpenCode."
+  info "  3. Usa /sdd-status 001-mi-idea para ver la fase actual."
+
+  if [[ "$TEST_COMMAND" == "no definido" ]]; then
+    warn "No se ha definido un comando de tests. Edita AGENTS.md y los agentes cuando lo tengas."
+  fi
+}
+
+parse_args "$@"
+main
